@@ -1,7 +1,6 @@
 import os
 import sys
 import tempfile
-import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -10,8 +9,10 @@ import requests
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+INTERAPI_KEY = os.environ["INTERAPI_KEY"]
 REST = f"{SUPABASE_URL}/rest/v1"
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+INTERAPI = "https://api.interapi.dev"
 MAX_VIDEO_BYTES = 49 * 1024 * 1024
 BATCH_SIZE = 3
 TIMEOUT = 30
@@ -47,45 +48,86 @@ def update_request(request_id: int, status: str, error: str | None = None) -> No
     response.raise_for_status()
 
 
-def allowed_video_url(url: str) -> bool:
+def source_for(url: str) -> str | None:
     try:
         host = (urlparse(url).hostname or "").lower().rstrip(".")
     except ValueError:
-        return False
-    allowed = ("youtube.com", "youtu.be", "tiktok.com", "pinterest.com", "pin.it")
-    return any(host == domain or host.endswith("." + domain) for domain in allowed)
+        return None
+
+    domains = {
+        "tiktok": ("tiktok.com",),
+        "youtube": ("youtube.com", "youtu.be"),
+        "pinterest": ("pinterest.com", "pin.it"),
+    }
+    for source, suffixes in domains.items():
+        if any(host == domain or host.endswith("." + domain) for domain in suffixes):
+            return source
+    return None
 
 
-def download_video(url: str, folder: Path) -> Path:
-    output = folder / "%(id)s.%(ext)s"
-    command = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-progress",
-        "--socket-timeout", "20",
-        "--retries", "2",
-        "--fragment-retries", "2",
-        "--max-filesize", "49M",
-        "--format", "best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "--recode-video", "mp4",
-        "--output", str(output),
-        url,
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=240)
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "Download failed").strip()
-        if "max-filesize" in details.lower() or "file is larger" in details.lower():
-            raise ValueError("Видео слишком большое для отправки через Telegram (лимит этого бота — 49 МБ).")
-        raise RuntimeError("Не удалось получить видео. Возможно, ссылка недоступна или источник временно ограничил загрузку.")
-    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".m4v", ".mov"}]
-    if not files:
-        raise RuntimeError("Загрузчик не создал MP4-файл.")
-    video = max(files, key=lambda p: p.stat().st_size)
-    if video.stat().st_size > MAX_VIDEO_BYTES:
-        raise ValueError("Видео больше 49 МБ — Telegram не позволит отправить его этим способом.")
-    return video
+def download_video(source: str, url: str, folder: Path) -> Path:
+    # InterAPI's file proxy returns the media itself. The API key is kept
+    # server-side in GitHub Actions secrets and is never sent to Telegram.
+    if source == "youtube":
+        endpoint = f"{INTERAPI}/api/v1/youtube/file"
+        params = {"url": url, "kind": "video", "format_id": "best", "api": INTERAPI_KEY}
+    else:
+        endpoint = f"{INTERAPI}/api/v1/media/file"
+        params = {"source": source, "url": url, "api": INTERAPI_KEY}
+
+    try:
+        with requests.get(
+            endpoint,
+            params=params,
+            stream=True,
+            timeout=(20, 180),
+            allow_redirects=True,
+        ) as response:
+            if not response.ok:
+                # Do not include the request URL: it contains the private API key.
+                detail = ""
+                try:
+                    payload = response.json()
+                    detail = str(payload.get("message") or payload.get("error") or "")
+                except Exception:
+                    pass
+                if response.status_code == 401:
+                    raise RuntimeError("InterAPI: ключ не принят. Проверьте секрет INTERAPI_KEY в GitHub.")
+                if response.status_code == 402:
+                    raise RuntimeError("InterAPI: закончились кредиты на аккаунте.")
+                if response.status_code == 429:
+                    raise RuntimeError("InterAPI: превышен лимит запросов. Попробуйте позже.")
+                if response.status_code in (400, 403, 404):
+                    raise RuntimeError("InterAPI не смог обработать эту ссылку. Проверьте, что видео общедоступно.")
+                raise RuntimeError(f"InterAPI вернул ошибку HTTP {response.status_code}. {detail[:160]}")
+
+            content_type = response.headers.get("content-type", "").lower()
+            if "json" in content_type or "text/html" in content_type:
+                try:
+                    payload = response.json()
+                    detail = payload.get("message") or payload.get("error") or payload.get("description")
+                except Exception:
+                    detail = None
+                raise RuntimeError(f"InterAPI не вернул видеофайл. {str(detail or '')[:160]}")
+
+            output = folder / "video.mp4"
+            total = 0
+            with output.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_VIDEO_BYTES:
+                        raise ValueError("Видео больше 49 МБ — Telegram не позволит отправить его этим способом.")
+                    file.write(chunk)
+
+            if total < 1024:
+                raise RuntimeError("InterAPI вернул пустой или слишком маленький файл.")
+            return output
+    except requests.Timeout:
+        raise RuntimeError("InterAPI не ответил вовремя. Попробуйте ещё раз.")
+    except requests.RequestException:
+        raise RuntimeError("Не удалось получить видео от InterAPI. Попробуйте позже.")
 
 
 def send_video(chat_id: int, path: Path) -> None:
@@ -120,10 +162,11 @@ def process(row: dict) -> None:
     url = row["source_url"]
 
     try:
-        if not allowed_video_url(url):
+        source = source_for(url)
+        if source not in {"tiktok", "youtube", "pinterest"}:
             raise ValueError("Поддерживаются только общедоступные ссылки TikTok, YouTube и Pinterest.")
         with tempfile.TemporaryDirectory(prefix="video-bot-") as temp:
-            video = download_video(url, Path(temp))
+            video = download_video(source, url, Path(temp))
             send_video(chat_id, video)
         update_request(request_id, "sent")
         print(f"Request {request_id}: sent")

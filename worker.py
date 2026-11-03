@@ -9,7 +9,7 @@ import requests
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-INTERAPI_KEY = os.environ["INTERAPI_KEY"]
+INTERAPI_KEY = os.environ["INTERAPI_KEY"].strip()
 REST = f"{SUPABASE_URL}/rest/v1"
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 INTERAPI = "https://api.interapi.dev"
@@ -79,6 +79,7 @@ def download_video(source: str, url: str, folder: Path) -> Path:
         with requests.get(
             endpoint,
             params=params,
+            headers={"X-API-Key": INTERAPI_KEY},
             stream=True,
             timeout=(20, 180),
             allow_redirects=True,
